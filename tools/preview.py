@@ -142,9 +142,9 @@ def row(cv, y, left, right, sel):
 # ------------------------------------------------------------------ 各屏
 def scr_home(cv, words):
     header(cv, "小喵背单词")
-    names = ["今日学习", "快速复习", "四选一测验", "拼写练习", "单词闯关", "错词本", "统计", "设置"]
-    rights = ["20新 8复", "8", "", "", "星6 关2", "12", "", ""]
-    for i in range(8):
+    names = ["今日学习", "快速复习", "四选一测验", "拼写练习", "单词闯关", "配对消消乐", "字母重组", "错词本", "统计", "设置"]
+    rights = ["20新 8复", "8", "", "", "星6 关2", "", "", "12", "", ""]
+    for i in range(7):
         row(cv, LIST_TOP + i * ITEM_H, names[i], rights[i], i == 0)
     footer(cv, "第1场  %d词" % len(words))
 
@@ -194,6 +194,56 @@ def scr_gresult(cv):
     cv.center("答对 10/10   最高连击 7", 58, C_FG, "FONT_12")
     cv.center("第3关  星级 3", 74, C_DIM, "FONT_12")
     footer(cv, "A 再来一次   B 选关")
+
+
+def scr_match(cv, words):
+    header(cv, "配对消消乐 1")
+    cv.right("配对 2", W - 3, 2, C_ACCENT, "FONT_12")
+    cw, ch = 76, 30
+    x0, y0 = 3, 18
+    # 6 张牌：3 英文 + 3 中文
+    cards = [(0, words[0]["en"]), (1, words[0]["zh"]), (0, words[1]["en"]),
+             (1, words[1]["zh"]), (0, words[2]["en"]), (1, words[2]["zh"])]
+    matched = [0, 1, 0, 0, 1, 0]  # 第2、5张已消除
+    for i in range(6):
+        cx = x0 + (i % 2) * (cw + 2)
+        cy = y0 + (i // 2) * (ch + 2)
+        sel = i == 0
+        bg = C_OK if matched[i] else (C_SEL if sel else C_PANEL)
+        cv.fill(cx, cy, cw, ch, bg)
+        if not matched[i]:
+            kind, txt = cards[i]
+            f = "FONT_16" if cv.tw(txt, "FONT_16") <= cw - 8 else "FONT_12"
+            cv.trunc(txt, cx + 4, cy + (8 if f == "FONT_16" else 9), cw - 8, C_FG, f)
+    footer(cv, "方向选   A 翻牌配对   B 退出")
+
+
+def scr_scramble(cv, w):
+    header(cv, "字母重组 1")
+    for i in range(3):
+        cv.fill(W - 10 - i * 8, 4, 6, 6, C_ERR if i < 3 else C_DIM)
+    cv.text(w["zh"][:10], 3, 17, C_FG, "FONT_16")
+    word = w["en"]
+    ln = len(word)
+    step = min(14, (W - 16) // max(ln, 1))
+    sx = (W - ln * step) // 2
+    # 已填前 2 位
+    for i in range(ln):
+        x = sx + i * step
+        cv.text(word[i] if i < 2 else "_", x, 44, C_FG if i < 2 else C_DIM, "FONT_16")
+    # 候选字母
+    cstep = 16
+    cx = (W - ln * cstep) // 2
+    for i in range(ln):
+        x = cx + i * cstep
+        sel = i == 1
+        if i < 2:
+            cv.fill(x - 2, 64, 14, 16, C_DIM)
+        else:
+            cv.fill(x - 2, 64, 14, 16, C_ACCENT if sel else C_PANEL)
+            cv.text(word[i], x, 65, C_BG if sel else C_FG, "FONT_16")
+    cv.center("得分 20", 92, C_ACCENT, "FONT_12")
+    footer(cv, "←→选字母   A 填入   B 退出")
 
 
 def scr_card(cv, w):
@@ -349,6 +399,12 @@ def main():
         fn(cv, *args)
         screens.append(cv.img)
 
+    # 新游戏预览
+    for fn, args in [(scr_match, (words,)), (scr_scramble, (w0,))]:
+        cv = Canvas()
+        fn(cv, *args)
+        screens.append(cv.img)
+
     # 屏保预览
     for fn, args in [(saver_clock, ()), (saver_word, (w0,)), (saver_cat, ())]:
         cv = Canvas()
@@ -356,7 +412,7 @@ def main():
         screens.append(cv.img)
 
     scale = 3
-    cols, rows = 3, 4
+    cols, rows = 3, 5
     sheet = Image.new("RGB", (W * scale * cols + (cols + 1) * 8, H * scale * rows + (rows + 1) * 8), (28, 30, 36))
     for i, im in enumerate(screens):
         cx, cy = i % cols, i // cols

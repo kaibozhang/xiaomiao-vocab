@@ -437,16 +437,16 @@ void setEnabled(bool en) { on = en; }
 bool enabled() { return on; }
 
 void tone(uint32_t freq, uint32_t ms) {
-    if (!ready || !on) { delay(ms); return; }
+    if (!ready || !on) return;              // 非阻塞：关音效时直接返回
     if (freq) ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, freq);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 512);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    delay(ms);
+    delay(ms);                               // 发声时长（无源蜂鸣器需持续 PWM）
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
 void click() { tone(2400, 12); }
 void ok()    { tone(1568, 70); delay(20); tone(2093, 90); }
-void err()   { tone(220, 260); }
+void err()   { tone(220, 200); }
 }  // namespace Sound

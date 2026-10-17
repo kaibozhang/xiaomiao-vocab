@@ -88,6 +88,7 @@ static void serialCmd() {
                 }
                 case 'r': Serial.println("[cmd] rebooting"); delay(50); ESP.restart(); break;
                 case 'p': Serial.printf("[scr] id=%d saver=%d\n", App::screenId(), (int)App::inScreensaver()); break;
+                case 'g': App::gameDump(); break;
                 case 'k': App::debugKey((uint8_t)atoi(line + 1)); break;
                 case 'z': {          // 随机按键压力测试
                     int n2 = atoi(line + 1);

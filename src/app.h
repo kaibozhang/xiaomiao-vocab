@@ -16,4 +16,5 @@ int  screenId();               // 当前屏幕编号（自检用）
 
 void selfTest();               // 串口自检（发送 t）
 void selfTestSaver();          // 串口屏保自检（发送 e）
+void gameDump();               // 串口 dump 闯关内部状态（发送 g）
 }
