@@ -1,0 +1,16 @@
+# 构建产物
+.pio/
+build.log
+firmware-merged.bin
+*.bin
+!preview/*.png
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
