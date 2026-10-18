@@ -56,9 +56,13 @@ struct Config {
 
 namespace Store {
 void begin();
-void save();
+void save();                      // 立即保存：配置 + 脏掉的进度块
 void saveIfDirty();
-void markDirty();
+void markDirty();                 // 配置脏（设置项），下次 saveIfDirty 秒存 NVS
+void markWordDirty(int i);        // 第 i 个词的学习状态脏了（按 4KB 块增量写）
+void markAllProgDirty();          // 整个进度数组脏（清空进度等），下次保存整文件重写
+void clearProgress();             // 清空学习进度（保留设置）
+void resetConfig();               // 恢复默认设置（保留 WiFi 凭据与学习进度）
 
 extern WordState* st;
 extern Config cfg;

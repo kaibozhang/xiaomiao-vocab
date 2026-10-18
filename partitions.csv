@@ -1,6 +1,9 @@
 # XiaoMiao handheld - 4MB flash partition table
 # Name,     Type, SubType, Offset,   Size,     Flags
+# 注意：fs/prog 必须位于从未被 LittleFS 格式化过的干净区域，
+# 否则旧超级块与新分区大小不符会让 esp_littlefs 在 mount 时断言崩溃。
 nvs,        data, nvs,     0x9000,   0x5000,
 phy_init,   data, phy,     0xE000,   0x1000,
-factory,    app,  factory, 0x10000,  0x3B0000,
-prog,       data, spiffs,  0x3C0000, 0x40000,
+factory,    app,  factory, 0x10000,  0x380000,
+fs,         data, spiffs,  0x390000, 0x10000,
+prog,       data, spiffs,  0x3A0000, 0x60000,

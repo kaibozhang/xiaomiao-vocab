@@ -4,6 +4,7 @@
 #include <string.h>
 #include "driver/ledc.h"
 #include "esp_heap_caps.h"
+#include "lights.h"
 
 Gfx gfx;
 
@@ -446,7 +447,7 @@ void tone(uint32_t freq, uint32_t ms) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-void click() { tone(2400, 12); }
-void ok()    { tone(1568, 70); delay(20); tone(2093, 90); }
-void err()   { tone(220, 200); }
+void click() { if (on) tone(2400, 12); else Lights::click(); }
+void ok()    { if (on) { tone(1568, 70); delay(20); tone(2093, 90); } else Lights::ok(); }
+void err()   { if (on) tone(220, 200); else Lights::err(); }
 }  // namespace Sound

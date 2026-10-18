@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-把 PlatformIO 产出的 bootloader / 分区表 / app 合并成单文件并刷入小喵掌机。
+把 PlatformIO 产出的 bootloader / 分区表 / app 刷入小喵掌机。
+
+重要：按各自偏移量分别写入（不做合并大 bin）！
+合并写入会把 0xFF 间隙区盖到 NVS(0x9000) 等分区上，esptool 擦扇区时
+会清掉用户设置和 WiFi 凭据；分别写只碰 bootloader/分区表/app 三个区域，
+NVS 与 prog(学习进度) 分区原样保留 —— 刷固件不再丢进度。
 
 用法:
     python tools/flash.py            # 默认 COM3
     python tools/flash.py COM5
-    python tools/flash.py --merge    # 只合并，不刷
+    python tools/flash.py --merge    # 旧行为：合并成单文件再写（会清 NVS，仅调试用）
 """
 import os
 import subprocess
@@ -68,22 +73,24 @@ def main():
             print("缺少 %s，请先运行: pio run" % p)
             return 1
 
-    cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "merge_bin",
-           "-o", OUT, "--flash_size", "4MB", "--flash_mode", "dio", "--flash_freq", "40m"]
-    for off, p in files.items():
-        cmd += [off, p]
-    print(" ".join(cmd))
-    if subprocess.call(cmd) != 0:
-        return 1
-    print("合并完成: %s (%d bytes)" % (OUT, os.path.getsize(OUT)))
-
     if merge_only:
+        cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "merge_bin",
+               "-o", OUT, "--flash_size", "4MB", "--flash_mode", "dio", "--flash_freq", "40m"]
+        for off, p in files.items():
+            cmd += [off, p]
+        print(" ".join(cmd))
+        if subprocess.call(cmd) != 0:
+            return 1
+        print("合并完成: %s (%d bytes)" % (OUT, os.path.getsize(OUT)))
         return 0
 
-    w = [sys.executable, "-m", "esptool", "--chip", "esp32", "--port", port,
-         "--baud", "460800", "write_flash", "-z", "0x0", OUT]
-    print(" ".join(w))
-    return subprocess.call(w)
+    cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "--port", port,
+           "--baud", "460800", "write_flash", "-z",
+           BOOT_OFF, files[BOOT_OFF],
+           PART_OFF, files[PART_OFF],
+           factory_offset(), files[factory_offset()]]
+    print(" ".join(cmd))
+    return subprocess.call(cmd)
 
 
 if __name__ == "__main__":

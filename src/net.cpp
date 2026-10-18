@@ -196,6 +196,7 @@ void startServer() {
                 Store::st[idx].due = (uint16_t)due;
                 Store::st[idx].flags = (uint8_t)flags;
                 Store::st[idx].ease10 = 25;
+                Store::markWordDirty(idx);   // 增量保存：只写这个词所在的块
                 restored++;
             }
             p = e + 1;

@@ -8,6 +8,7 @@
 #include "net.h"
 #include "saver.h"
 #include "status.h"
+#include "lights.h"
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <stdio.h>
@@ -30,7 +31,8 @@ enum Screen {
     SCR_STATS, SCR_SETTINGS, SCR_BOOKS, SCR_ABOUT, SCR_SUMMARY, SCR_MSG,
     SCR_WIFI, SCR_SCAN, SCR_PW, SCR_TIME,
     SCR_GLEVELS, SCR_GPLAY, SCR_GRESULT,
-    SCR_MATCH, SCR_MATCHRESULT, SCR_SCRAMBLE, SCR_SCRAMBLERESULT
+    SCR_MATCH, SCR_MATCHRESULT, SCR_SCRAMBLE, SCR_SCRAMBLERESULT,
+    SCR_HANG, SCR_HANGEND, SCR_CHAIN, SCR_CHAINEND
 };
 
 enum SessMode { SM_CARD = 0, SM_QUIZ = 1, SM_SPELL = 2 };
@@ -80,12 +82,13 @@ static bool gWon = false;
 static bool resetConfirm = false;
 
 // ---- 单词配对消消乐 ----
+#define M_CARDS   12                 // 12 张牌 = 6 对（3 列 x 4 行）
 static int  mPairs = 6;                 // 每关配对数
 static int  mSel1 = -1, mSel2 = -1;     // 已选中的两张牌
-static int  mMatched[6];                // 每张牌是否已消除（1 已消除）
-static int  mCards[6];                  // 6 张牌的单词 index（前3英文后3中文，或混合）
-static int  mCardKind[6];               // 0=英文 1=中文
-static int  mCursor = 0;                // 当前光标（0..5）
+static int  mMatched[M_CARDS];          // 每张牌是否已消除（1 已消除）
+static int  mCards[M_CARDS];            // 每张牌的单词 index
+static int  mCardKind[M_CARDS];         // 0=英文 1=中文
+static int  mCursor = 0;                // 当前光标（0..11）
 static int  mScore = 0, mTries = 0;
 static int  mLevel = 1;
 
@@ -100,6 +103,33 @@ static int  sBuilt[16];                 // 已填字母（存原单词下标）
 static int  sScore = 0, sCorrect = 0, sTotal = 0;
 static int  sLives = 3;
 
+// ---- 猜单词（Hangman）----
+#define HANG_LIVES 6
+#define HANG_MAXLEN 10
+static int  hWord = 0;                  // 当前词 index
+static char hShown[HANG_MAXLEN + 1];    // 已猜出的显示（未猜出为 _）
+static bool hGuessed[26];               // 26 个字母是否猜过
+static int  hLives = HANG_LIVES;
+static int  hKbPos = 0;                 // 键盘光标 0..25
+static int  hScore = 0, hCorrect = 0, hTotal = 0;
+static int  hPhase = 0;                 // 0 进行中  1 猜对等待  2 猜错等待
+static uint32_t hPhaseEnd = 0;
+
+// ---- 单词接龙 ----
+static int  cWord = 0;                  // 当前词 index
+static int  cOpts[3];                   // 3 个候选词 index
+static int  cCorrect = 0;               // 正确选项下标 0..2
+static int  cSel = 0;
+static int  cLives = 3;
+static int  cCombo = 0, cMaxCombo = 0;
+static int  cScore = 0, cRound = 0;
+static int  cPhase = 0;                 // 0 进行中  1 反馈等待
+static uint32_t cPhaseEnd = 0;
+
+// 新游戏帧推进（定义在后方，gameTick 需要前向声明）
+static void hangTick(uint32_t nowMs);
+static void chainTick(uint32_t nowMs);
+
 static bool dirtyFlag = false;
 static char buf[48];
 
@@ -107,6 +137,7 @@ static char buf[48];
 static bool saverOn = false;
 static uint32_t lastAct = 0;
 static uint32_t saverFrame = 0;
+static uint16_t saverSecRt = 0xFFFF;    // 运行时屏保延时覆盖（自动化测试用），0xFFFF=跟随设置
 #define SAVER_FRAME_MS 100
 
 // ---- WiFi / 密码输入 ----
@@ -467,7 +498,7 @@ static void gameKeysResult(uint8_t k) {
 //  单词配对消消乐（英→中配对）
 // ===========================================================================
 static void matchPickWords() {
-    // 从启用词册随机挑 mPairs 个词，每个词取英文牌 + 中文牌
+    // 从启用词册随机挑 mPairs 个词，每个词取英文牌 + 中文牌，共 12 张
     int pool[64], pn = 0;
     for (int i = 0; i < ws_count() && pn < 64; i++)
         if (Store::bookEnabled(ws_book(i)) && ws_zh(i)[0] && ws_en(i)[0]) pool[pn++] = i;
@@ -479,13 +510,14 @@ static void matchPickWords() {
         mCards[i * 2 + 1] = w;                   // 奇数位中文
         mCardKind[i * 2 + 1] = 1;
     }
-    // 打乱 6 张牌的顺序
-    int order[6] = {0, 1, 2, 3, 4, 5};
-    shuffleRange(order, 6);
-    int tmpC[6], tmpK[6];
-    for (int i = 0; i < 6; i++) { tmpC[i] = mCards[order[i]]; tmpK[i] = mCardKind[order[i]]; }
-    for (int i = 0; i < 6; i++) { mCards[i] = tmpC[i]; mCardKind[i] = tmpK[i]; }
-    for (int i = 0; i < 6; i++) mMatched[i] = 0;
+    // 打乱 12 张牌的顺序
+    int order[M_CARDS];
+    for (int i = 0; i < M_CARDS; i++) order[i] = i;
+    shuffleRange(order, M_CARDS);
+    int tmpC[M_CARDS], tmpK[M_CARDS];
+    for (int i = 0; i < M_CARDS; i++) { tmpC[i] = mCards[order[i]]; tmpK[i] = mCardKind[order[i]]; }
+    for (int i = 0; i < M_CARDS; i++) { mCards[i] = tmpC[i]; mCardKind[i] = tmpK[i]; }
+    for (int i = 0; i < M_CARDS; i++) mMatched[i] = 0;
 }
 
 static void matchStart() {
@@ -516,10 +548,10 @@ static void matchFinish() {
 
 static void matchKeys(uint8_t k) {
     if (k & BTN_B) { Store::save(); scr = SCR_HOME; sel = 5; markDraw(); return; }
-    if (k & BTN_LEFT)  { if (mCursor % 2 == 1) { mCursor--; Sound::click(); markDraw(); } }
-    if (k & BTN_RIGHT) { if (mCursor % 2 == 0 && mCursor < 5) { mCursor++; Sound::click(); markDraw(); } }
-    if (k & BTN_UP)    { if (mCursor >= 2) { mCursor -= 2; Sound::click(); markDraw(); } }
-    if (k & BTN_DOWN)  { if (mCursor < 4) { mCursor += 2; Sound::click(); markDraw(); } }
+    if (k & BTN_LEFT)  { if (mCursor % 3 > 0) { mCursor--; Sound::click(); markDraw(); } }
+    if (k & BTN_RIGHT) { if (mCursor % 3 < 2 && mCursor < M_CARDS - 1) { mCursor++; Sound::click(); markDraw(); } }
+    if (k & BTN_UP)    { if (mCursor >= 3) { mCursor -= 3; Sound::click(); markDraw(); } }
+    if (k & BTN_DOWN)  { if (mCursor < M_CARDS - 3) { mCursor += 3; Sound::click(); markDraw(); } }
     if (k & BTN_A) {
         if (mMatched[mCursor]) return;               // 已消除的牌不可选
         if (mSel1 < 0) {
@@ -539,7 +571,7 @@ static void matchKeys(uint8_t k) {
                 mSel1 = mSel2 = -1;
                 // 全部消除 → 下一轮
                 bool done = true;
-                for (int i = 0; i < 6; i++) if (!mMatched[i]) done = false;
+                for (int i = 0; i < M_CARDS; i++) if (!mMatched[i]) done = false;
                 if (done) matchNextRound();
                 markDraw();
             } else {
@@ -559,12 +591,12 @@ static void drawMatch() {
     snprintf(buf, sizeof(buf), "配对 %d", mScore);
     gfx.textRight(buf, SCR_W - 3, 2, C_ACCENT, FONT_12);
 
-    // 2 列 x 3 行网格，每张牌 76x30
-    int cw = 76, chh = 30;
-    int x0 = 3, y0 = 18;
-    for (int i = 0; i < 6; i++) {
-        int cx = x0 + (i % 2) * (cw + 2);
-        int cy = y0 + (i / 2) * (chh + 2);
+    // 3 列 x 4 行网格，每张牌 51x23
+    int cw = 51, chh = 23;
+    int x0 = 3, y0 = 17;
+    for (int i = 0; i < M_CARDS; i++) {
+        int cx = x0 + (i % 3) * (cw + 1);
+        int cy = y0 + (i / 3) * (chh + 1);
         bool sel = (mCursor == i) || (mSel1 == i);
         uint16_t bg = C_PANEL;
         if (mMatched[i]) bg = C_OK;
@@ -577,7 +609,7 @@ static void drawMatch() {
             int maxw = cw - 8;
             int f = FONT_12;
             if (gfx.textWidth(txt, FONT_16) <= maxw) f = FONT_16;
-            gfx.textMax(txt, cx + 4, cy + (f == FONT_16 ? 8 : 9), maxw, C_FG, f);
+            gfx.textMax(txt, cx + 4, cy + (f == FONT_16 ? 4 : 6), maxw, C_FG, f);
         }
     }
     footer("方向选   A 翻牌配对   B 退出");
@@ -607,6 +639,12 @@ static void scrambleMakeWord() {
     for (int i = 0; i < ws_count() && pn < 64; i++) {
         int l = (int)strlen(ws_en(i));
         if (Store::bookEnabled(ws_book(i)) && ws_zh(i)[0] && l >= 3 && l <= 8) pool[pn++] = i;
+    }
+    if (pn == 0) {                    // 理论上不会发生；防御性退出
+        Store::save();
+        scr = SCR_HOME;
+        sel = 6;
+        return;
     }
     sWord = pool[esp_random() % pn];
     const char* w = ws_en(sWord);
@@ -653,10 +691,15 @@ static void scrambleKeys(uint8_t k) {
             sBuilt[sPos] = sScrambled[sSelIdx];
             sPos++;
             Sound::click();
-            // 填满则判定
+            // 填满则判定（按字母比较，含重复字母的词也能拼对）
             if (sPos >= sLen) {
                 bool ok = true;
-                for (int i = 0; i < sLen; i++) if (sBuilt[i] != i) ok = false;
+                const char* w = ws_en(sWord);
+                for (int i = 0; i < sLen; i++) {
+                    char a = w[sBuilt[i]]; if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                    char b = w[i];         if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                    if (a != b) { ok = false; break; }
+                }
                 if (ok) {
                     sCorrect++; sScore += 10;
                     Store::answer(sWord, true);
@@ -743,39 +786,415 @@ static void scrambleResultKeys(uint8_t k) {
 
 // 每 250ms 调用一次（App::tick），负责倒计时与反馈推进
 static void gameTick(uint32_t nowMs) {
-    if (scr != SCR_GPLAY) return;
-    if (feedback) {
-        if ((int32_t)(nowMs - feedbackEnd) >= 0) gameAdvance();
-        return;
-    }
-    if (gLastSec == 0) { gLastSec = nowMs; return; }
-    if (nowMs - gLastSec >= 1000) {
-        gLastSec += 1000;
-        if (--gTimer <= 0) { gTimer = 0; gameSubmit(false); }
-        markDraw();
+    if (scr == SCR_GPLAY) {
+        if (feedback) {
+            if ((int32_t)(nowMs - feedbackEnd) >= 0) gameAdvance();
+            return;
+        }
+        if (gLastSec == 0) { gLastSec = nowMs; return; }
+        if (nowMs - gLastSec >= 1000) {
+            gLastSec += 1000;
+            if (--gTimer <= 0) { gTimer = 0; gameSubmit(false); }
+            markDraw();
+        }
+    } else if (scr == SCR_HANG) {
+        hangTick(nowMs);
+    } else if (scr == SCR_CHAIN) {
+        chainTick(nowMs);
     }
 }
 
 // ===========================================================================
-//  各屏渲染
+//  猜单词（Hangman）：看中文释义猜英文拼写，一次猜一个字母
 // ===========================================================================
+static void hangPickWord() {
+    int pool[64], pn = 0;
+    for (int i = 0; i < ws_count() && pn < 64; i++) {
+        int l = (int)strlen(ws_en(i));
+        if (Store::bookEnabled(ws_book(i)) && ws_zh(i)[0] && l >= 3 && l <= HANG_MAXLEN)
+            pool[pn++] = i;
+    }
+    if (pn == 0) {                      // 防御：没有可猜的词就回主菜单
+        Store::save();
+        scr = SCR_HOME;
+        sel = 7;
+        return;
+    }
+    hWord = pool[esp_random() % pn];
+    const char* w = ws_en(hWord);
+    int n = (int)strlen(w);
+    for (int i = 0; i < n; i++) hShown[i] = '_';
+    hShown[n] = 0;
+    for (int i = 0; i < 26; i++) hGuessed[i] = false;
+    hLives = HANG_LIVES;
+    hKbPos = 0;
+    hPhase = 0;
+}
+
+static void hangStart() {
+    hScore = hCorrect = hTotal = 0;
+    hangPickWord();
+    App::noteActivity();
+    scr = SCR_HANG;
+    markDraw();
+}
+
+static void hangNextWord() {
+    hTotal++;
+    hangPickWord();
+    markDraw();
+}
+
+static void hangGuess(int letter) {
+    if (hGuessed[letter]) { Sound::click(); return; }
+    hGuessed[letter] = true;
+    const char* w = ws_en(hWord);
+    bool hit = false;
+    for (int i = 0; w[i]; i++) {
+        char c = w[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c == (char)('a' + letter)) { hShown[i] = c; hit = true; }
+    }
+    if (hit) {
+        bool full = true;
+        for (int i = 0; hShown[i]; i++) if (hShown[i] == '_') full = false;
+        if (full) {
+            hCorrect++;
+            hScore += 20 + hLives * 5;
+            Store::answer(hWord, true);
+            Sound::ok();
+            hPhase = 1;
+            hPhaseEnd = millis() + 1300;
+        } else {
+            Sound::click();
+        }
+    } else {
+        hLives--;
+        Sound::err();
+        if (hLives <= 0) {
+            Store::answer(hWord, false);
+            hPhase = 2;
+            hPhaseEnd = millis() + 2300;
+        }
+    }
+    markDraw();
+}
+
+static void hangTick(uint32_t nowMs) {
+    if (hPhase == 1 || hPhase == 2) {
+        if ((int32_t)(nowMs - hPhaseEnd) >= 0) hangNextWord();
+    }
+}
+
+static void hangKeys(uint8_t k) {
+    if (hPhase != 0) return;             // 反馈动画期间屏蔽输入
+    if (k & BTN_B) { Store::save(); scr = SCR_HOME; sel = 7; markDraw(); return; }
+    if (k & BTN_LEFT)  { if (hKbPos % 7 > 0) { hKbPos--; Sound::click(); markDraw(); } }
+    if (k & BTN_RIGHT) { if (hKbPos % 7 < 6 && hKbPos < 25) { hKbPos++; Sound::click(); markDraw(); } }
+    if (k & BTN_UP)    { if (hKbPos >= 7) { hKbPos -= 7; Sound::click(); markDraw(); } }
+    if (k & BTN_DOWN)  { if (hKbPos < 19) { hKbPos += 7; Sound::click(); markDraw(); } }
+    if (k & BTN_A) { hangGuess(hKbPos); }
+}
+
+static void drawGallows(int wrong) {
+    // 绞架
+    gfx.hline(6, 66, 36, C_DIM);        // 底座
+    gfx.vline(12, 24, 42, C_DIM);       // 立柱
+    gfx.hline(12, 24, 30, C_DIM);       // 横梁
+    gfx.vline(40, 24, 8, C_DIM);        // 绳子
+    if (wrong < 1) return;
+    // 头
+    gfx.circle(40, 38, 6, C_FG);
+    if (wrong == 1) return;
+    // 身体
+    gfx.line(40, 44, 40, 56, C_FG);
+    if (wrong == 2) return;
+    // 左臂
+    gfx.line(40, 48, 32, 54, C_FG);
+    if (wrong == 3) return;
+    // 右臂
+    gfx.line(40, 48, 48, 54, C_FG);
+    if (wrong == 4) return;
+    // 左腿
+    gfx.line(40, 56, 33, 64, C_FG);
+    if (wrong == 5) return;
+    // 右腿
+    gfx.line(40, 56, 47, 64, C_FG);
+    // 输掉时的难过脸
+    gfx.line(36, 36, 39, 39, C_ERR);
+    gfx.line(39, 36, 36, 39, C_ERR);
+    gfx.line(41, 36, 44, 39, C_ERR);
+    gfx.line(44, 36, 41, 39, C_ERR);
+    gfx.line(37, 42, 43, 42, C_ERR);
+}
+
+static void drawHang() {
+    snprintf(buf, sizeof(buf), "猜单词 %d/%d", hCorrect, hTotal);
+    header(buf, "");
+    for (int i = 0; i < 3; i++)                 // 生命（小方块）
+        gfx.fillRect(SCR_W - 12 - i * 8, 4, 6, 6, i < hLives ? C_ERR : C_DIM);
+
+    drawGallows(HANG_LIVES - hLives);
+
+    // 待猜单词（右侧）
+    int n = (int)strlen(hShown);
+    int cell = n > 0 ? (92 / n) : 16;
+    if (cell > 16) cell = 16;
+    int sx = 64 + (92 - n * cell) / 2;
+    for (int i = 0; i < n; i++) {
+        char one[2] = {hShown[i], 0};
+        gfx.text(one[0] == '_' ? "_" : one, sx + i * cell, 26, hShown[i] == '_' ? C_DIM : C_FG, FONT_16);
+        gfx.hline(sx + i * cell + 1, 46, cell - 2, C_BAR);
+    }
+    // 中文释义提示
+    gfx.textWrap(ws_zh(hWord), 62, 50, 94, C_ACCENT, FONT_12, 14, 3);
+
+    // 猜错的字母
+    char wrong[32]; int wn = 0;
+    wrong[0] = 0;
+    for (int i = 0; i < 26; i++)
+        if (hGuessed[i] && !strchr(ws_en(hWord), 'a' + i) && !strchr(ws_en(hWord), 'A' + i)) {
+            if (wn < 28) { wrong[wn++] = (char)('a' + i); wrong[wn++] = ' '; wrong[wn] = 0; }
+        }
+    if (wn) gfx.textMax(wrong, 4, 68, 152, C_ERR, FONT_12);
+
+    // 字母键盘 7 列 x 4 行
+    for (int i = 0; i < 26; i++) {
+        int cx = 4 + (i % 7) * 22;
+        int cy = 82 + (i / 7) * 12;
+        bool cur = (hKbPos == i);
+        if (cur) gfx.fillRect(cx - 1, cy - 1, 19, 11, C_SEL);
+        uint16_t col = C_FG;
+        if (hGuessed[i]) {
+            bool inWord = strchr(ws_en(hWord), 'a' + i) || strchr(ws_en(hWord), 'A' + i);
+            col = inWord ? C_OK : C_ERR;
+        }
+        char one[2] = {(char)('a' + i), 0};
+        gfx.text(one, cx + 4, cy, col, FONT_12);
+    }
+    // 阶段提示
+    if (hPhase == 1) {
+        gfx.fillRect(20, 54, 120, 18, C_PANEL);
+        gfx.drawRect(20, 54, 120, 18, C_OK);
+        gfx.textCenter("猜对啦！", 57, C_OK, FONT_12);
+    } else if (hPhase == 2) {
+        gfx.fillRect(8, 54, 144, 18, C_PANEL);
+        gfx.drawRect(8, 54, 144, 18, C_ERR);
+        snprintf(buf, sizeof(buf), "答案是 %s", ws_en(hWord));
+        gfx.textCenter(buf, 57, C_ERR, FONT_12);
+    }
+    footer("方向选字母   A 猜   B 退出");
+}
+
+static void drawHangEnd() {
+    header("猜单词结束", "");
+    gfx.textCenter("游戏结束", 22, C_ACCENT, FONT_16);
+    snprintf(buf, sizeof(buf), "猜对 %d / %d", hCorrect, hTotal);
+    gfx.textCenter(buf, 46, C_FG, FONT_12);
+    snprintf(buf, sizeof(buf), "得分 %d", hScore);
+    gfx.textCenter(buf, 62, C_DIM, FONT_12);
+    footer("A 再来   B 返回");
+}
+
+// ===========================================================================
+//  单词接龙：选下一个词，首字母接上一个词的尾字母
+// ===========================================================================
+static void chainPickWord() {
+    int pool[64], pn = 0;
+    for (int i = 0; i < ws_count() && pn < 64; i++) {
+        int l = (int)strlen(ws_en(i));
+        if (Store::bookEnabled(ws_book(i)) && ws_zh(i)[0] && ws_en(i)[0] && l >= 3 && l <= 10)
+            pool[pn++] = i;
+    }
+    if (pn == 0) {                      // 防御：没有可玩的词就回主菜单
+        Store::save();
+        scr = SCR_HOME;
+        sel = 8;
+        return;
+    }
+    cWord = pool[esp_random() % pn];
+}
+
+// 生成 3 个选项：1 个首字母接得上（正确），2 个接不上；cCorrect 记录正确项下标
+static void chainMakeOpts() {
+    const char* w = ws_en(cWord);
+    char last = w[strlen(w) - 1];
+    if (last >= 'A' && last <= 'Z') last = (char)(last + 32);
+    int right[24], rn = 0, wrong[64], wn = 0;
+    for (int i = 0; i < ws_count(); i++) {
+        if (i == cWord || !ws_zh(i)[0] || !ws_en(i)[0]) continue;
+        if (!Store::bookEnabled(ws_book(i))) continue;
+        char f = ws_en(i)[0];
+        if (f >= 'A' && f <= 'Z') f = (char)(f + 32);
+        if (f == last) { if (rn < 24) right[rn++] = i; }
+        else if (wn < 64) wrong[wn++] = i;
+    }
+    if (rn == 0 || wn < 2) {
+        // 当前词接不上（词册被关到极少时的极端情况）：换一个当前词重试一次
+        chainPickWord();
+        const char* w2 = ws_en(cWord);
+        char last2 = w2[strlen(w2) - 1];
+        if (last2 >= 'A' && last2 <= 'Z') last2 = (char)(last2 + 32);
+        rn = wn = 0;
+        for (int i = 0; i < ws_count(); i++) {
+            if (i == cWord || !ws_zh(i)[0] || !ws_en(i)[0]) continue;
+            if (!Store::bookEnabled(ws_book(i))) continue;
+            char f = ws_en(i)[0];
+            if (f >= 'A' && f <= 'Z') f = (char)(f + 32);
+            if (f == last2) { if (rn < 24) right[rn++] = i; }
+            else if (wn < 64) wrong[wn++] = i;
+        }
+    }
+    int good, b1, b2;
+    if (rn > 0 && wn >= 2) {
+        good = right[esp_random() % rn];
+        b1 = wrong[esp_random() % wn];
+        b2 = wrong[esp_random() % wn];
+        int guard = 0;
+        while ((b1 == b2 || b1 == good || b2 == good) && guard++ < 50) {
+            b1 = wrong[esp_random() % wn];
+            b2 = wrong[esp_random() % wn];
+        }
+        if (b1 == b2 || b1 == good || b2 == good) {   // 理论上到不了
+            b1 = wrong[0];
+            b2 = wrong[wn - 1];
+        }
+    } else {
+        // 词册被关到极少时的退化处理：保证有 3 个选项、不卡死
+        good = (rn > 0) ? right[0] : cWord;
+        b1 = cWord;
+        b2 = (wn > 0) ? wrong[0] : good;
+        if (b2 == b1) b2 = good;
+    }
+    int trio[3] = {good, b1, b2};
+    shuffleRange(trio, 3);
+    for (int i = 0; i < 3; i++) {
+        cOpts[i] = trio[i];
+        if (trio[i] == good) cCorrect = i;
+    }
+    cSel = 0;
+}
+
+static void chainStart() {
+    cLives = 3;
+    cCombo = cMaxCombo = 0;
+    cScore = cRound = 0;
+    chainPickWord();
+    chainMakeOpts();
+    App::noteActivity();
+    scr = SCR_CHAIN;
+    markDraw();
+}
+
+static void chainTick(uint32_t nowMs) {
+    if (cPhase == 1 && (int32_t)(nowMs - cPhaseEnd) >= 0) {
+        cPhase = 0;
+        chainPickWord();
+        chainMakeOpts();
+        markDraw();
+    }
+}
+
+static void chainKeys(uint8_t k) {
+    if (cPhase != 0) return;
+    if (k & BTN_B) { Store::save(); scr = SCR_HOME; sel = 8; markDraw(); return; }
+    if (k & BTN_UP)   { if (cSel > 0) { cSel--; Sound::click(); markDraw(); } }
+    if (k & BTN_DOWN) { if (cSel < 2) { cSel++; Sound::click(); markDraw(); } }
+    if (k & BTN_A) {
+        int pick = cOpts[cSel];
+        if (cSel == cCorrect) {
+            Store::answer(pick, true);
+            cCombo++;
+            if (cCombo > cMaxCombo) cMaxCombo = cCombo;
+            cScore += 10 + cCombo * 2;
+            cRound++;
+            cWord = pick;               // 接龙：选中词成为新当前词
+            chainMakeOpts();
+            Sound::ok();
+        } else {
+            Store::answer(cOpts[cCorrect], false);
+            cLives--;
+            cCombo = 0;
+            Sound::err();
+            if (cLives <= 0) {
+                Store::save();
+                scr = SCR_CHAINEND;
+            } else {
+                cPhase = 1;
+                cPhaseEnd = millis() + 1500;
+            }
+        }
+        markDraw();
+    }
+}
+
+static void drawChain() {
+    snprintf(buf, sizeof(buf), "单词接龙 %d", cRound + 1);
+    header(buf, "");
+    for (int i = 0; i < 3; i++)                 // 生命
+        gfx.fillRect(SCR_W - 12 - i * 8, 4, 6, 6, i < cLives ? C_ERR : C_DIM);
+    if (cCombo > 1) {
+        snprintf(buf, sizeof(buf), "连击x%d", cCombo);
+        gfx.text(buf, 3, 15, C_ACCENT, FONT_12);
+    }
+
+    // 当前词 + 释义
+    const char* w = ws_en(cWord);
+    int f = gfx.textWidth(w, FONT_24) <= SCR_W - 16 ? FONT_24 : FONT_16;
+    gfx.textCenter(w, 24, C_FG, f);
+    gfx.textWrap(ws_zh(cWord), 4, 46, SCR_W - 8, C_DIM, FONT_12, 14, 2);
+
+    // 尾字母提示
+    char last = w[strlen(w) - 1];
+    if (last >= 'A' && last <= 'Z') last = (char)(last + 32);
+    snprintf(buf, sizeof(buf), "尾字母 %c", last);
+    gfx.textCenter(buf, 62, C_ACCENT, FONT_16);
+
+    // 3 个候选
+    for (int i = 0; i < 3; i++) {
+        int y = 78 + i * 12;
+        bool sel = (cSel == i);
+        if (sel) gfx.fillRect(4, y - 1, SCR_W - 8, 12, C_SEL);
+        gfx.textMax(ws_en(cOpts[i]), 8, y, 96, sel ? C_FG : C_FG, FONT_12);
+        gfx.textRight(ws_zh(cOpts[i]), SCR_W - 8, y, sel ? C_ACCENT : C_DIM, FONT_12);
+    }
+    // 反馈提示
+    if (cPhase == 1) {
+        bool good = (cSel == cCorrect);
+        snprintf(buf, sizeof(buf), good ? "" : "正确的是 %s", ws_en(cOpts[cCorrect]));
+        if (!good) gfx.textCenter(buf, 66, C_ERR, FONT_12);
+    }
+    footer("↑↓ 选择   A 确认   B 退出");
+}
+
+static void drawChainEnd() {
+    header("接龙结束", "");
+    gfx.textCenter("游戏结束", 22, C_ACCENT, FONT_16);
+    snprintf(buf, sizeof(buf), "接龙 %d 个   最高连击 %d", cRound, cMaxCombo);
+    gfx.textCenter(buf, 46, C_FG, FONT_12);
+    snprintf(buf, sizeof(buf), "得分 %d", cScore);
+    gfx.textCenter(buf, 62, C_DIM, FONT_12);
+    footer("A 再来   B 返回");
+}
+
 static void drawHome() {
     header("小喵背单词", "");
     int due = Store::countDue();
     int nw = Store::countNew();
     int take = nw < (int)Store::cfg.dailyNew - (int)Store::cfg.todayNew ? nw : (int)Store::cfg.dailyNew - (int)Store::cfg.todayNew;
     if (take < 0) take = 0;
-    const char* names[10] = {"今日学习", "快速复习", "四选一测验", "拼写练习", "单词闯关", "配对消消乐", "字母重组", "错词本", "统计", "设置"};
+    const char* names[12] = {"今日学习", "快速复习", "四选一测验", "拼写练习", "单词闯关", "配对消消乐",
+                             "字母重组", "猜单词", "单词接龙", "错词本", "统计", "设置"};
     if (scroll < 0) scroll = 0;
-    if (scroll > 10 - 7) scroll = 10 - 7;
+    if (scroll > 12 - 7) scroll = 12 - 7;
     for (int r = 0; r < 7; r++) {
         int i = scroll + r;
-        if (i >= 10) break;
+        if (i >= 12) break;
         const char* right = "";
         if (i == 0) { snprintf(buf, sizeof(buf), "%d新 %d复", take, due); right = buf; }
         else if (i == 1) { snprintf(buf, sizeof(buf), "%d", due); right = buf; }
         else if (i == 4) { snprintf(buf, sizeof(buf), "星%d 关%d", Store::gameStarsTotal(), Store::gameUnlocked()); right = buf; }
-        else if (i == 7) { snprintf(buf, sizeof(buf), "%d", Store::countWrong()); right = buf; }
+        else if (i == 9) { snprintf(buf, sizeof(buf), "%d", Store::countWrong()); right = buf; }
         rowItem(i, LIST_TOP + r * ITEM_H, names[i], right, sel == i);
     }
     snprintf(buf, sizeof(buf), "第%d场  %d词", Store::cfg.dayIndex, Store::enabledWordCount());
@@ -1308,7 +1727,7 @@ static void drawTime() {
 // ===========================================================================
 static void homeKeys(uint8_t k) {
     if (k & BTN_UP) { if (sel > 0) { sel--; Sound::click(); } if (sel < scroll) scroll = sel; markDraw(); }
-    if (k & BTN_DOWN) { if (sel < 9) { sel++; Sound::click(); } if (sel > scroll + 6) scroll = sel - 6; markDraw(); }
+    if (k & BTN_DOWN) { if (sel < 11) { sel++; Sound::click(); } if (sel > scroll + 6) scroll = sel - 6; markDraw(); }
     if (k & BTN_A) {
         Sound::click();
         switch (sel) {
@@ -1319,9 +1738,11 @@ static void homeKeys(uint8_t k) {
             case 4: scr = SCR_GLEVELS; gLevelSel = 0; break;
             case 5: matchStart(); break;
             case 6: scrambleStart(); break;
-            case 7: scr = SCR_WRONG; wrongSel = 0; wrongScroll = 0; clearConfirm = false; break;
-            case 8: scr = SCR_STATS; break;
-            case 9: scr = SCR_SETTINGS; sel = 0; scroll = 0; resetConfirm = false; break;
+            case 7: hangStart(); break;
+            case 8: chainStart(); break;
+            case 9: scr = SCR_WRONG; wrongSel = 0; wrongScroll = 0; clearConfirm = false; break;
+            case 10: scr = SCR_STATS; break;
+            case 11: scr = SCR_SETTINGS; sel = 0; scroll = 0; resetConfirm = false; break;
         }
         markDraw();
     }
@@ -1390,7 +1811,7 @@ static void spellKeys(uint8_t k) {
 static void wrongKeys(uint8_t k) {
     int total = Store::countWrong();
     int items = total + 1;
-    if (k & BTN_B) { scr = SCR_HOME; sel = 7; markDraw(); return; }
+    if (k & BTN_B) { scr = SCR_HOME; sel = 9; markDraw(); return; }
     if (k & BTN_UP) { if (wrongSel > 0) { wrongSel--; Sound::click(); } clearConfirm = false; markDraw(); }
     if (k & BTN_DOWN) { if (wrongSel < items - 1) { wrongSel++; Sound::click(); } clearConfirm = false; markDraw(); }
     if (k & BTN_LEFT) { if (wrongSel >= 7) { wrongSel -= 7; Sound::click(); } clearConfirm = false; markDraw(); }
@@ -1465,10 +1886,8 @@ static void settingsKeys(uint8_t k) {
             case 10:
                 if (!resetConfirm) resetConfirm = true;
                 else {
-                    memset(Store::st, 0, sizeof(WordState) * MAX_WORDS);
+                    Store::clearProgress();      // 复用 store 的实现，避免两处逻辑走偏
                     Store::cfg.totalAnswers = Store::cfg.totalCorrect = 0;
-                    Store::cfg.todayNew = Store::cfg.todayReview = 0;
-                    Store::cfg.todayAnswers = Store::cfg.todayCorrect = 0;
                     Store::cfg.streak = 1;
                     Store::save();
                     resetConfirm = false;
@@ -1534,7 +1953,7 @@ static void settingsKeys(uint8_t k) {
         Sound::click();
         markDraw();
     }
-    if (k & BTN_B) { Store::save(); scr = SCR_HOME; sel = 9; scroll = 0; markDraw(); }
+    if (k & BTN_B) { Store::save(); scr = SCR_HOME; sel = 11; scroll = 0; markDraw(); }
 }
 
 static void booksKeys(uint8_t k) {
@@ -1695,12 +2114,22 @@ static void timeKeys(uint8_t k) {
 // ===========================================================================
 bool inScreensaver() { return saverOn; }
 
-void noteActivity() {
+// 自动化测试用：临时覆盖屏保闲置时长（秒），不写入 NVS；sec<0 恢复跟随设置
+void setSaverSecRuntime(int sec) {
+    saverSecRt = (sec < 0 || sec > 65534) ? 0xFFFF : (uint16_t)sec;
+    lastAct = millis();                 // 立即重新计时，避免切换瞬间误触
+}
+
+// 有按键到来：刷新活跃时间；若正在屏保，退出屏保并"消费"掉这个按键
+// （唤醒键不穿透到当前界面，避免醒屏瞬间误触功能——比如设置里预览屏保时按 A 又触发预览）
+bool noteActivity() {
     lastAct = millis();
     if (saverOn) {
         saverOn = false;
         markDraw();
+        return true;
     }
+    return false;
 }
 
 void tick(uint32_t nowMs) {
@@ -1711,7 +2140,12 @@ void tick(uint32_t nowMs) {
         }
         return;
     }
-    if (Store::cfg.saverSec && (uint32_t)(nowMs - lastAct) > (uint32_t)Store::cfg.saverSec * 1000u) {
+    // 防误触：lastAct 可能在本帧 update() 内刚被刷新（例如进游戏/退出屏保时），
+    // 此时 nowMs 比 lastAct 旧，直接相减会无符号下溢成 ~42.9 亿，被误判为闲置过久。
+    // 只有 nowMs >= lastAct 时才比较闲置时长；下一帧 nowMs 变新后自然恢复。
+    uint32_t secs = (saverSecRt != 0xFFFF) ? saverSecRt : Store::cfg.saverSec;
+    if (secs && nowMs >= lastAct &&
+        (uint32_t)(nowMs - lastAct) > secs * 1000u) {
         saverOn = true;
         Saver::enter();
         saverFrame = nowMs;
@@ -1723,6 +2157,28 @@ void tick(uint32_t nowMs) {
 void gameDump() {
     Serial.printf("[game] scr=%d lv=%d q=%d/%d correct=%d bad=%d lives=%d combo=%d timer=%d fb=%d optC=%d optSel=%d qmode=%d\n",
         (int)scr, gLevel, gQIdx, GAME_QN, gCorrect, gBad, gLives, gCombo, gTimer, feedback, optCorrect, optSel, gQMode);
+    if (scr == SCR_HANG) {
+        Serial.printf("[hang] word=%s shown=%s lives=%d kb=%d phase=%d score=%d ok=%d/%d\n",
+                      ws_en(hWord), hShown, hLives, hKbPos, hPhase, hScore, hCorrect, hTotal);
+    } else if (scr == SCR_CHAIN) {
+        Serial.printf("[chain] cur=%s opts=%s,%s,%s correct=%d sel=%d lives=%d combo=%d round=%d phase=%d\n",
+                      ws_en(cWord), ws_en(cOpts[0]), ws_en(cOpts[1]), ws_en(cOpts[2]),
+                      cCorrect, cSel, cLives, cCombo, cRound, cPhase);
+    } else if (scr == SCR_SCRAMBLE) {
+        Serial.printf("[scr] word=%s len=%d pos=%d sel=%d lives=%d score=%d ok=%d/%d order=",
+                      ws_en(sWord), sLen, sPos, sSelIdx, sLives, sScore, sCorrect, sTotal);
+        for (int i = 0; i < sLen; i++) Serial.printf("%d,", sScrambled[i]);
+        Serial.printf(" built=");
+        for (int i = 0; i < sLen; i++) Serial.printf("%d,", sBuilt[i]);
+        Serial.println();
+    } else if (scr == SCR_MATCH) {
+        Serial.printf("[match] cards=");
+        for (int i = 0; i < M_CARDS; i++) Serial.printf("%d,", mCards[i]);
+        Serial.printf(" matched=");
+        for (int i = 0; i < M_CARDS; i++) Serial.printf("%d,", mMatched[i]);
+        Serial.printf(" cursor=%d sel1=%d sel2=%d score=%d tries=%d level=%d\n",
+                      mCursor, mSel1, mSel2, mScore, mTries, mLevel);
+    }
 }
 
 // ===========================================================================
@@ -1769,7 +2225,7 @@ static void scanText(const char* s, const char* what, int* miss) {
 }
 
 void debugKey(uint8_t mask) {
-    noteActivity();
+    if (noteActivity()) return;   // 与真实按键路径一致：唤醒键被消费，不穿透
     update(mask);
 }
 
@@ -1848,7 +2304,11 @@ void selfTest() {
                             "←→ 调整   A 进入   B 返回", "A 勾选   ←全选   →清空   B 返回", "B 返回",
                             "第1关 1/10", "星0 关0", "连击 x2", "通关", "挑战结束", "好棒，闯关成功",
                             "差一点点，再来", "答对 8/10   最高连击 3", "第1关  星级 3",
-                            "A 再来一次   B 选关", "←→↑↓ 选关  A 开始  B 返回"};
+                            "A 再来一次   B 选关", "←→↑↓ 选关  A 开始  B 返回",
+                            "配对消消乐", "配对完成", "太棒了！", "共配对", "尝试", "A 再来   B 返回",
+                            "方向选   A 翻牌配对   B 退出", "字母重组", "字母重组 1", "猜单词", "猜单词结束",
+                            "猜对啦！", "答案是", "方向选字母   A 猜   B 退出", "单词接龙", "接龙结束",
+                            "尾字母", "连击x", "游戏结束", "猜对", "得分", "接龙"};
         int um = 0;
         for (size_t i = 0; i < sizeof(ui) / sizeof(ui[0]); i++) scanText(ui[i], ui[i], &um);
         Serial.printf("  界面文案缺字 %d 处\n", um);
@@ -1869,14 +2329,14 @@ void selfTest() {
     {
         Screen saveScr = scr;
         uint32_t t1 = millis();
-        for (int s = 0; s <= SCR_SCRAMBLERESULT; s++) {
+        for (int s = 0; s <= SCR_CHAINEND; s++) {
             scr = (Screen)s;
             gfx.clear(C_BG);
             render();
         }
         uint32_t dt = millis() - t1;
         scr = saveScr;
-        Serial.printf("  22 屏渲染耗时 %lu ms\n", (unsigned long)dt);
+        Serial.printf("  26 屏渲染耗时 %lu ms\n", (unsigned long)dt);
         ck(dt < 4000, "渲染耗时正常");
         gfx.flush();
     }
@@ -1905,6 +2365,63 @@ void selfTest() {
         int p = Power::percent();
         ck(p >= -1 && p <= 100, "电量取值范围");
         Serial.printf("  电量 %d%%（模式 %s）\n", p, Power::modeName(Store::cfg.battMode));
+    }
+
+    // 9b. 屏保误触竞态回归（now 旧于 lastAct 时不得开启/重开屏保）
+    {
+        Screen  svScr = scr;
+        bool    svSaver = saverOn;
+        int     svFb = feedback;
+        uint32_t svFbEnd = feedbackEnd;
+        uint16_t svSec = Store::cfg.saverSec;
+        uint16_t svRt = saverSecRt;
+
+        scr = SCR_HOME;                 // 离开游戏屏，避免 gameTick 副作用
+        feedback = 0;
+        saverOn = false;
+        Store::cfg.saverSec = 30;
+        saverSecRt = 0xFFFF;            // 屏蔽测试用的运行时覆盖，保证用例确定性
+
+        // (a) 本帧内刷新 lastAct 后，用过旧的时间戳 tick：绝不允许开启屏保
+        uint32_t t = millis();
+        delay(3);
+        noteActivity();                 // lastAct = millis() > t（模拟 update() 内刷新）
+        tick(t);
+        ck(!saverOn, "屏保防误触：时间戳旧于 lastAct");
+
+        // (b) 退出屏保的那个按键，不得让屏保立刻重开
+        saverOn = true;
+        uint32_t t2 = millis();
+        delay(3);
+        update(BTN_A);                  // 内部 saverOn=false, lastAct=millis()>t2
+        ck(!saverOn, "按键可退出屏保");
+        tick(t2);
+        ck(!saverOn, "退出屏保后不立刻重开");
+
+        // (c) 正常路径仍然有效：闲置超时必须能开启
+        tick(millis() + 31000);
+        ck(saverOn, "闲置超时正常开启屏保");
+
+        saverOn = svSaver;
+        scr = svScr;
+        feedback = svFb;
+        feedbackEnd = svFbEnd;
+        Store::cfg.saverSec = svSec;
+        saverSecRt = svRt;
+        lastAct = millis();
+    }
+
+    // 9c. I2C 灯控（静音时用灯光反馈）
+    {
+        bool on0 = Lights::available();
+        ck(on0, "I2C 灯控 0x40 在线");
+        Serial.printf("  灯控 0x40 %s（SCL=%d SDA=%d，静音反馈%s）\n",
+                      on0 ? "在线" : "不在线", PIN_I2C_SCL, PIN_I2C_SDA,
+                      on0 ? "可用" : "不可用");
+        if (on0) {
+            Lights::pulse(2, 80, 80);   // 非阻塞登记，接下来几秒内闪 2 下，肉眼可确认
+            ck(Lights::off(), "灯控寄存器可写");
+        }
     }
 
     // 10. 网络状态
@@ -1965,11 +2482,13 @@ void update(uint8_t k) {
         case SCR_MATCHRESULT: matchResultKeys(k); break;
         case SCR_SCRAMBLE: scrambleKeys(k); break;
         case SCR_SCRAMBLERESULT: scrambleResultKeys(k); break;
+        case SCR_HANG:     hangKeys(k); break;
+        case SCR_CHAIN:    chainKeys(k); break;
         case SCR_LEARN:    cardKeys(k); break;
         case SCR_QUIZ:     quizKeys(k); break;
         case SCR_SPELL:    spellKeys(k); break;
         case SCR_WRONG:    wrongKeys(k); break;
-        case SCR_STATS:    if (k & (BTN_B | BTN_A)) { scr = SCR_HOME; sel = 8; } markDraw(); break;
+        case SCR_STATS:    if (k & (BTN_B | BTN_A)) { scr = SCR_HOME; sel = 10; } markDraw(); break;
         case SCR_SETTINGS: settingsKeys(k); break;
         case SCR_BOOKS:    booksKeys(k); break;
         case SCR_WIFI:     wifiKeys(k); break;
@@ -1984,6 +2503,16 @@ void update(uint8_t k) {
             break;
         case SCR_MSG:
             if (k & (BTN_B | BTN_A)) { scr = SCR_HOME; }
+            markDraw();
+            break;
+        case SCR_HANGEND:
+            if (k & BTN_A) hangStart();
+            else if (k & BTN_B) { scr = SCR_HOME; sel = 7; }
+            markDraw();
+            break;
+        case SCR_CHAINEND:
+            if (k & BTN_A) chainStart();
+            else if (k & BTN_B) { scr = SCR_HOME; sel = 8; }
             markDraw();
             break;
     }
@@ -2004,6 +2533,10 @@ void render() {
         case SCR_MATCHRESULT: drawMatchResult(); break;
         case SCR_SCRAMBLE: drawScramble(); break;
         case SCR_SCRAMBLERESULT: drawScrambleResult(); break;
+        case SCR_HANG:     drawHang(); break;
+        case SCR_HANGEND:  drawHangEnd(); break;
+        case SCR_CHAIN:    drawChain(); break;
+        case SCR_CHAINEND: drawChainEnd(); break;
         case SCR_LEARN:    drawCard(); break;
         case SCR_QUIZ:     drawQuiz(); break;
         case SCR_SPELL:    drawSpell(); break;
