@@ -915,6 +915,8 @@ def t_soak(dev):
     print("=== 17. 随机按键压测 ===", flush=True)
     # GD32 串口桥偶发吞首字节（z3000 → z000 → 默认 2000 次），而且设备忙时会彻底漏收，
     # 所以允许重发，只要最终收到 [soak] 就算压测跑通。
+    # 只认最终汇总行（"[soak] 3000 次按键 .. ms"）；中途的 "[soak] 慢键 .." 探针行不能算完。
+    SOAK_DONE = re.compile(r"\[soak\] \d+ 次按键 \d+ ms")
     joined = ""
     for attempt in range(3):
         dev.cmd("z3000", 0.5)
@@ -922,15 +924,15 @@ def t_soak(dev):
         end = time.time() + 90
         while time.time() < end:
             out += dev._drain(0.5)
-            if any("soak" in l for l in out):
+            if any(SOAK_DONE.search(l) for l in out):
                 break
         joined = "\n".join(out)
-        if "soak" in joined:
+        if SOAK_DONE.search(joined):
             break
         dev.cmd("p", 0.3)
         print("  压测第 %d 次未返回，探针 i=%s p=%s"
               % (attempt + 1, dev.cmd("i", 0.4), dev.cmd("p", 0.4)), flush=True)
-    check("soak" in joined, "压测完成", joined[-160:])
+    check(bool(SOAK_DONE.search(joined)), "压测完成", joined[-160:])
     m = re.search(r"剩余堆 (\d+)", joined)
     check(bool(m) and int(m.group(1)) > 100000, "压测后堆内存健康", m.group(0) if m else "")
     s = dev.screen()
@@ -979,9 +981,25 @@ def main():
         t_wifi_time(dev)
         t_soak(dev)
     finally:
-        # 恢复：蜂鸣器（按设置值恢复为开）、屏保延时
+        # 恢复：蜂鸣器、屏保延时、默认设置与学习进度。
+        # 最后一步很关键：压测那 3000 次随机按键会把词册全勾掉、把设置改乱、
+        # 把词全答完（实测 books=0/21 enabled=0），不复位的话机器上所有游戏都会退化，
+        # 只显示词库第一行 ruler —— 看起来就像"固件里没有真实词库"。
         dev.cmd("m1", 0.2)
         dev.cmd("M-1", 0.2)
+        dev.cmd("R", 0.5)            # 恢复默认设置（保留 WiFi）
+        dev.cmd("P", 2.0)            # 清空被压测污染的学习进度
+        info = dev.info()
+        cfg = dev.cfg()
+        print("  测试后状态：%s" % (info or ""), flush=True)
+        print("  测试后配置：%s" % (cfg or ""), flush=True)
+        # enabled 在 cfg 行里：[cfg] ... books=21/21 enabled=5211
+        clean = bool(cfg and "enabled=5211" in cfg)
+        check(clean, "测试结束后设备回到干净起点", str(cfg))
+        # rst=1 表示上电复位；若压测期间偷偷崩过，这里会变成 4(PANIC)/6(TASK_WDT) 等
+        rst = re.search(r"rst=(\d+)", info or "")
+        check(bool(rst) and rst.group(1) in ("1", "2", "3"),
+              "压测期间没有偷偷重启", f"rst={rst.group(1) if rst else '?'}")
         dev.close()
 
     print(f"\n========== 结果：通过 {PASS} 失败 {FAIL} ==========", flush=True)

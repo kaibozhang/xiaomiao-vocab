@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>      // esp_reset_reason：便于事后判断设备有没有偷偷重启过
 #include <stdio.h>
 #include <Wire.h>
 #include "hal.h"
@@ -40,12 +41,13 @@ static void serialCmd() {
                 case 't': App::selfTest(); break;
                 case 'e': App::selfTestSaver(); break;
                 case 'i':
-                    Serial.printf("[info] words=%d user=%d fs=%d wifi=%d ip=%s time=%lu synced=%d batt=%d due=%d new=%d wrong=%d light=%d\n",
+                    Serial.printf("[info] words=%d user=%d fs=%d wifi=%d ip=%s time=%lu synced=%d batt=%d due=%d new=%d wrong=%d light=%d rst=%d up=%lu\n",
                                   ws_count(), ws_userCount(), (int)Store::fsReady(),
                                   (int)Net::status(), Net::ipString().c_str(),
                                   (unsigned long)Clock::now(), (int)Clock::synced(),
                                   Power::percent(), Store::countDue(), Store::countNew(),
-                                  Store::countWrong(), (int)Lights::available());
+                                  Store::countWrong(), (int)Lights::available(),
+                                  (int)esp_reset_reason(), (uint32_t)millis());
                     Serial.printf("[cfg] dailyNew=%d sound=%d orient=%d bgr=%d saverMode=%d saverSec=%d battMode=%d books=%d/%d enabled=%d\n",
                                   Store::cfg.dailyNew, Store::cfg.soundOn, Store::cfg.orient,
                                   Store::cfg.bgr, Store::cfg.saverMode, Store::cfg.saverSec,

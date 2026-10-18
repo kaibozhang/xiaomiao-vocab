@@ -388,6 +388,23 @@ static void gameMakeQ() {
     optSel = 0;
 }
 
+// 词库可用性检查。
+// 以前词册全被关掉时，选词池为空，各游戏的 picker 会退化到单词下标 0（词库第一行 ruler），
+// 界面上就永远是同一个词、还不报错——看着像"固件里根本没有词库"。
+// 现在统一拦一道：词不够就给一句人话提示，并把光标停在该游戏的主菜单行上。
+static bool ensureWords(int need, int menuIdx) {
+    if (Store::enabledWordCount() >= need) return true;
+    Store::save();
+    scr = SCR_MSG;
+    const char* tip = (Store::enabledWordCount() == 0)
+                          ? "请在设置里勾选词册"
+                          : "启用的词太少，多勾几册";
+    snprintf(msgLine, sizeof(msgLine), "%s", tip);
+    sel = menuIdx;
+    markDraw();
+    return false;
+}
+
 static void gameNextQ() {
     feedback = 0;
     gQMode = gQIdx % 3;             // 三种题型轮换
@@ -398,6 +415,7 @@ static void gameNextQ() {
 }
 
 static void gameStart(int lv) {
+    if (!ensureWords(6, 4)) return;
     gLevel = lv;
     gQIdx = 0;
     gCorrect = gBad = 0;
@@ -521,6 +539,7 @@ static void matchPickWords() {
 }
 
 static void matchStart() {
+    if (!ensureWords(8, 5)) return;
     mLevel = 1;
     mScore = 0;
     mTries = 0;
@@ -658,6 +677,7 @@ static void scrambleMakeWord() {
 }
 
 static void scrambleStart() {
+    if (!ensureWords(3, 6)) return;
     sScore = 0;
     sCorrect = 0;
     sTotal = 0;
@@ -832,6 +852,7 @@ static void hangPickWord() {
 }
 
 static void hangStart() {
+    if (!ensureWords(3, 7)) return;
     hScore = hCorrect = hTotal = 0;
     hangPickWord();
     App::noteActivity();
@@ -1017,33 +1038,23 @@ static void chainPickWord() {
 
 // 生成 3 个选项：1 个首字母接得上（正确），2 个接不上；cCorrect 记录正确项下标
 static void chainMakeOpts() {
-    const char* w = ws_en(cWord);
-    char last = w[strlen(w) - 1];
-    if (last >= 'A' && last <= 'Z') last = (char)(last + 32);
     int right[24], rn = 0, wrong[64], wn = 0;
-    for (int i = 0; i < ws_count(); i++) {
-        if (i == cWord || !ws_zh(i)[0] || !ws_en(i)[0]) continue;
-        if (!Store::bookEnabled(ws_book(i))) continue;
-        char f = ws_en(i)[0];
-        if (f >= 'A' && f <= 'Z') f = (char)(f + 32);
-        if (f == last) { if (rn < 24) right[rn++] = i; }
-        else if (wn < 64) wrong[wn++] = i;
-    }
-    if (rn == 0 || wn < 2) {
-        // 当前词接不上（词册被关到极少时的极端情况）：换一个当前词重试一次
-        chainPickWord();
+    // 有些尾字母接不上任何词（比如以 x 结尾），多换几次起始词，别让玩家看到三个一样的选项
+    for (int attempt = 0; attempt < 12; attempt++) {
+        if (attempt) chainPickWord();
         const char* w2 = ws_en(cWord);
-        char last2 = w2[strlen(w2) - 1];
-        if (last2 >= 'A' && last2 <= 'Z') last2 = (char)(last2 + 32);
+        char last = w2[strlen(w2) - 1];
+        if (last >= 'A' && last <= 'Z') last = (char)(last + 32);
         rn = wn = 0;
         for (int i = 0; i < ws_count(); i++) {
             if (i == cWord || !ws_zh(i)[0] || !ws_en(i)[0]) continue;
             if (!Store::bookEnabled(ws_book(i))) continue;
             char f = ws_en(i)[0];
             if (f >= 'A' && f <= 'Z') f = (char)(f + 32);
-            if (f == last2) { if (rn < 24) right[rn++] = i; }
+            if (f == last) { if (rn < 24) right[rn++] = i; }
             else if (wn < 64) wrong[wn++] = i;
         }
+        if (rn > 0 && wn >= 2) break;
     }
     int good, b1, b2;
     if (rn > 0 && wn >= 2) {
@@ -1060,11 +1071,17 @@ static void chainMakeOpts() {
             b2 = wrong[wn - 1];
         }
     } else {
-        // 词册被关到极少时的退化处理：保证有 3 个选项、不卡死
-        good = (rn > 0) ? right[0] : cWord;
-        b1 = cWord;
-        b2 = (wn > 0) ? wrong[0] : good;
-        if (b2 == b1) b2 = good;
+        // 极端：实在接不上（词册被关到极少），退化成三个互不相同的词，别显示一模一样的选项
+        int pool[24], pn = 0;
+        for (int i = 0; i < ws_count() && pn < 24; i++)
+            if (i != cWord && ws_en(i)[0] && ws_zh(i)[0] && Store::bookEnabled(ws_book(i)))
+                pool[pn++] = i;
+        if (pn >= 3) {
+            shuffleRange(pool, pn);
+            good = pool[0]; b1 = pool[1]; b2 = pool[2];
+        } else {
+            good = cWord; b1 = cWord; b2 = cWord;
+        }
     }
     int trio[3] = {good, b1, b2};
     shuffleRange(trio, 3);
@@ -1076,6 +1093,7 @@ static void chainMakeOpts() {
 }
 
 static void chainStart() {
+    if (!ensureWords(6, 8)) return;
     cLives = 3;
     cCombo = cMaxCombo = 0;
     cScore = cRound = 0;
